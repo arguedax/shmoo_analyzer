@@ -259,9 +259,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 :root{--bg:#f6f7f9;--panel:#fff;--bd:#d8dce3;--txt:#1d2330;--mut:#6b7385;--acc:#0068b5;--pass:#3fb950}
 *{box-sizing:border-box}
 body{margin:0;font:13px/1.4 Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--txt);display:flex;flex-direction:column;height:100vh}
-header{padding:8px 14px;background:#0b2a4a;color:#fff;display:flex;gap:18px;align-items:baseline;flex-wrap:wrap}
+header{padding:8px 14px;background:#0b2a4a;color:#fff;display:flex;gap:18px;align-items:center;flex-wrap:wrap}
+header .brand{display:flex;align-items:center;gap:10px;flex:none}
+header .logo{width:48px;height:48px;flex:none;display:block}
 header h1{font-size:16px;margin:0}
-header .meta{color:#c5d3e6;font-size:12px}
+header .meta{color:#c5d3e6;font-size:12px;flex:1 1 320px;min-width:0;overflow-wrap:anywhere}
 main{flex:1;display:flex;min-height:0}
 aside{width:380px;min-width:260px;background:var(--panel);border-right:1px solid var(--bd);display:flex;flex-direction:column;min-height:0;resize:horizontal;overflow:auto}
 aside h3{margin:10px 10px 4px;font-size:12px;text-transform:uppercase;color:var(--mut);letter-spacing:.04em;display:flex;justify-content:space-between}
@@ -311,7 +313,35 @@ table.ov td.t{max-width:520px;overflow:hidden;text-overflow:ellipsis;cursor:poin
 .ok{background:#d6f5dc}.bad{background:#ffd7d5}.na{color:#aaa}
 .hint{color:var(--mut);font-size:11px;margin:4px 0 10px}
 </style></head><body>
-<header><h1>Shmoo-Nav</h1><span class="meta" id="meta"></span></header>
+<header>
+<div class="brand">
+<svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="48" height="48" aria-hidden="true" focusable="false">
+<circle cx="60" cy="60" r="56" fill="#1d3237"/>
+<circle cx="60" cy="60" r="50" fill="none" stroke="#527076" stroke-width="1.5"/>
+<path d="M60 8V18M60 102V112M8 60H18M102 60H112" stroke="#caed62" stroke-width="3" stroke-linecap="round"/>
+<g fill="#2fbf8f">
+<rect x="29" y="29" width="18" height="18" rx="4"/>
+<rect x="51" y="29" width="18" height="18" rx="4"/>
+<rect x="73" y="29" width="18" height="18" rx="4"/>
+<rect x="73" y="51" width="18" height="18" rx="4"/>
+<rect x="73" y="73" width="18" height="18" rx="4"/>
+</g>
+<g fill="#f07a5f">
+<rect x="29" y="51" width="18" height="18" rx="4"/>
+<rect x="29" y="73" width="18" height="18" rx="4"/>
+<rect x="51" y="73" width="18" height="18" rx="4"/>
+</g>
+<rect x="51" y="51" width="18" height="18" rx="4" fill="#ffd166" stroke="#1b2b28" stroke-width="2.5"/>
+<g transform="translate(48.12 71.88) rotate(45) scale(.6)">
+<path d="M0 -28L-20 22L0 10L20 22Z" fill="none" stroke="#1d3237" stroke-width="10" stroke-linejoin="round"/>
+<path d="M0 -28L-20 22L0 10Z" fill="#ffffff"/>
+<path d="M0 -28L0 10L20 22Z" fill="#c8dfd7"/>
+</g>
+</svg>
+<h1>Shmoo-Nav</h1>
+</div>
+<span class="meta" id="meta"></span>
+</header>
 <main>
 <aside>
   <h3>Units <span><a id="uall">all</a> / <a id="unone">none</a></span></h3>
