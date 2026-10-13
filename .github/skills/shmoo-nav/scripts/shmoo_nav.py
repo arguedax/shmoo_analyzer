@@ -1,7 +1,7 @@
-"""Extract shmoo results from ituff files and build an interactive HTML viewer.
+"""Shmoo-Nav: extract shmoo results from ituff files and build an interactive HTML viewer.
 
 Usage:
-    python ituff_shmoo_html.py <ituff[.gz] | directory | glob> [...] [-o out.html] [--csv out.csv] [--filter REGEX]
+    python shmoo_nav.py <ituff[.gz] | directory | glob> [...] [-o out.html] [--csv out.csv] [--filter REGEX]
 
 Ituff shmoo records (per unit, per test):
     0_tname_<test>_ShmooParams      0_strgval_<x>^<xs>^<xe>^<xstep>^<y>^<ys>^<ye>^<ystep>_ShmooHub
@@ -311,7 +311,7 @@ table.ov td.t{max-width:520px;overflow:hidden;text-overflow:ellipsis;cursor:poin
 .ok{background:#d6f5dc}.bad{background:#ffd7d5}.na{color:#aaa}
 .hint{color:var(--mut);font-size:11px;margin:4px 0 10px}
 </style></head><body>
-<header><h1>Ituff Shmoo Viewer</h1><span class="meta" id="meta"></span></header>
+<header><h1>Shmoo-Nav</h1><span class="meta" id="meta"></span></header>
 <main>
 <aside>
   <h3>Units <span><a id="uall">all</a> / <a id="unone">none</a></span></h3>
