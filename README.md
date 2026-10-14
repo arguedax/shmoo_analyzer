@@ -55,6 +55,7 @@ python .github\skills\shmoo-nav\scripts\shmoo_nav.py <VPO | ituff | folder | glo
 | `--csv` | Also write a per-point CSV (unit, test, X, Y, result, pattern, plist, vector, cycle, pins). |
 | `--filter` | Case-insensitive regex; keep only shmoo tests whose name matches. |
 | `--sites` | Sites to search for a VPO. Default: `sc,cr,an,fm,jf`. |
+| `--test-program` | Only report where each lot's test program lives (folder, `BaseTestPlan.tpl`, flow `.stpl`); reads headers only, no HTML. |
 
 A bare VPO (e.g. `I642014CR`) is looked up as `\\amr.corp.intel.com\ec\proj\mdl\<site>\intel\hdmxdata\{prod,engr}\<VPO>_*` across the sites (about 10 s), and every ituff chunk in the matching folder is used. The shares only keep roughly the last month of data.
 
@@ -63,6 +64,9 @@ Examples:
 ```powershell
 # By VPO (searches all sites)
 python .github\skills\shmoo-nav\scripts\shmoo_nav.py I642014CR
+
+# Which test program did this lot run?
+python .github\skills\shmoo-nav\scripts\shmoo_nav.py I642014CR --test-program
 
 # Whole lot folder
 python .github\skills\shmoo-nav\scripts\shmoo_nav.py "\\amr.corp.intel.com\ec\proj\mdl\cr\intel\hdmxdata\prod\J642051MV_6248"

@@ -35,6 +35,7 @@ ITUFF_RE = re.compile(r"\.(itf|ituff)(\.gz)?$", re.I)
 PRE_UNIT_KEYS = {"prtnm", "eqpprtid", "siteid", "socket", "dvtststdt", "tiuid", "prttesterid"}
 POST_UNIT_KEYS = {"curfbin", "curibin", "binn", "trslt", "dvtsteddt"}
 HEADER_KEYS = {"lotid", "prgnm", "prdct", "sysid", "tempr", "processstep", "facid", "flstpid", "lcode"}
+TP_ATTRS = {"tplpath", "stplpath", "socpath", "envpath", "tpbasepath"}
 LEGEND_RE = re.compile(r"^(?P<pat>[^|]*)\|(?P<idx>\d+):(?P<rest>.*)$")
 LOC_RE = re.compile(r":(?P<dom>[A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)*)\((?P<loc>[^)]*)\):(?P<pins>.*)$")
 
@@ -147,6 +148,10 @@ def parse_ituff(path: Path, name_filter: re.Pattern | None) -> dict:
                         pending[key] = val
                 elif lvl in ("4", "5", "6") and key in HEADER_KEYS and key not in header:
                     header[key] = val
+                elif lvl == "4" and key == "tsattrs":
+                    name, _, v = val.partition(",")
+                    if name in TP_ATTRS and name not in header:
+                        header[name] = v
                 elif line == "2_lbeg":
                     unit = {"info": dict(pending), "shmoos": {}, "order": []}
                     pending = {}
@@ -212,12 +217,88 @@ def fmt_unit_label(info: dict, idx: int) -> str:
     return " | ".join(parts)
 
 
+def read_tp_header(path: Path) -> dict:
+    """Program name and test-program tsattrs from the ituff header (stops at the first unit)."""
+    header: dict[str, str] = {}
+    with open_ituff(path) as fh:
+        for line in fh:
+            line = line.rstrip("\r\n")
+            if line == "2_lbeg":
+                break
+            if line.startswith("6_prgnm_"):
+                header.setdefault("prgnm", line[8:])
+            elif line.startswith("4_tsattrs_"):
+                name, _, v = line[10:].partition(",")
+                if name in TP_ATTRS:
+                    header.setdefault(name, v)
+    return header
+
+
+def resolve_tester_path(raw: str, ituff_path: Path) -> Path | None:
+    """Map a tester path to a reachable share path.
+
+    The tester's I: is the site share's ...\\intel folder, i.e. whatever precedes \\hdmxdata\\ in the ituff's
+    own path; other sites are tried as a fallback. Tester-local drives (e.g. D:\\TPRecipes) can't be resolved.
+    """
+    if not raw or raw[:2].upper() != "I:":
+        return None
+    rel = raw[2:].lstrip("\\/")
+    roots: list[Path] = []
+    m = re.match(r"(?i)(.*?)[\\/]hdmxdata[\\/]", str(ituff_path))
+    if m:
+        roots.append(Path(m[1] + "\\"))
+    roots += [Path(HDMX_ROOT) / s / "intel" for s in SITES]
+    for root in roots:
+        cand = root / rel
+        try:
+            if cand.exists():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def trace_test_program(header: dict, ituff_path: Path) -> dict:
+    tpl = resolve_tester_path(header.get("tplpath", ""), ituff_path)
+    stpl = resolve_tester_path(header.get("stplpath", ""), ituff_path)
+    return {
+        "program": header.get("prgnm", ""),
+        "tplpath": header.get("tplpath", ""),
+        "stplpath": header.get("stplpath", ""),
+        "tp_dir": str(tpl.parent) if tpl else "",
+        "tpl": str(tpl) if tpl else "",
+        "stpl": str(stpl) if stpl else "",
+        "tester_local": {k: header[k] for k in ("socpath", "envpath") if header.get(k)},
+    }
+
+
+def print_test_programs(paths: list[Path], headers: list[dict]) -> None:
+    seen: set[str] = set()
+    for p, h in zip(paths, headers):
+        key = h.get("tplpath", "") or h.get("prgnm", "")
+        if key in seen:
+            continue
+        seen.add(key)
+        tp = trace_test_program(h, p)
+        print(f"Test program {tp['program'] or '?'} ({p.name}):")
+        if tp["tp_dir"]:
+            print(f"  folder : {tp['tp_dir']}")
+            print(f"  tpl    : {tp['tpl']}")
+            if tp["stpl"]:
+                print(f"  stpl   : {tp['stpl']}")
+        elif tp["tplpath"]:
+            print(f"  not found on any site share; tester path was {tp['tplpath']}")
+        else:
+            print("  no tplpath recorded in this ituff")
+
+
 def collect(paths: list[Path], name_filter: re.Pattern | None) -> dict:
     files, units, tests = [], [], {}
     for fi, p in enumerate(paths):
         print(f"Parsing {p} ...")
         parsed = parse_ituff(p, name_filter)
-        files.append({"name": p.name, "path": str(p), "header": parsed["header"]})
+        files.append({"name": p.name, "path": str(p), "header": parsed["header"],
+                      "tp": trace_test_program(parsed["header"], p)})
         for u in parsed["units"]:
             if not u["order"]:
                 continue
@@ -380,7 +461,9 @@ const group=t=>{const p=t.split("::");p.pop();return p.join("::")||"(none)"};
 
 function header(){
   const h=DATA.files.map(f=>{const x=f.header;return `${f.name}  |  lot ${x.lotid||"?"}  |  ${x.prgnm||""}  |  ${x.processstep||x.flstpid||""}  |  ${x.tempr?x.tempr+"C":""}  |  ${x.sysid||""}`});
-  $("#meta").textContent=h.join("   ||   ")+`   (generated ${DATA.generated})`;
+  const tps=[...new Set(DATA.files.map(f=>f.tp&&(f.tp.tp_dir||f.tp.tplpath)).filter(Boolean))];
+  $("#meta").textContent=h.join("   ||   ")+(tps.length?`   |   TP: ${tps.join(" ; ")}`:"")+`   (generated ${DATA.generated})`;
+  $("#meta").title=DATA.files.map(f=>f.tp?`${f.name}\nprogram: ${f.tp.program}\nfolder: ${f.tp.tp_dir||"(not found on shares)"}\ntpl: ${f.tp.tpl||f.tp.tplpath}\nstpl: ${f.tp.stpl||f.tp.stplpath}`:f.name).join("\n\n");
 }
 
 function renderUnits(){
@@ -519,14 +602,42 @@ def write_html(data: dict, out: Path) -> None:
     out.write_text(HTML_TEMPLATE.replace("__TITLE__", title).replace("__DATA__", payload), encoding="utf-8")
 
 
+def _list_dirs_matching(base: Path, prefix: str) -> list[str]:
+    """Names of subfolders of base starting with prefix (case-insensitive)."""
+    if os.name == "nt":
+        # Server-side wildcard filter: avoids listing thousands of lot folders over SMB.
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.FindFirstFileW.restype = wintypes.HANDLE
+        k32.FindFirstFileW.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(wintypes.WIN32_FIND_DATAW))
+        k32.FindNextFileW.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.WIN32_FIND_DATAW))
+        k32.FindClose.argtypes = (wintypes.HANDLE,)
+        data = wintypes.WIN32_FIND_DATAW()
+        h = k32.FindFirstFileW(str(base / f"{prefix}*"), ctypes.byref(data))
+        if h is None or h == wintypes.HANDLE(-1).value:
+            return []
+        names = []
+        try:
+            while True:
+                if data.dwFileAttributes & 0x10:  # FILE_ATTRIBUTE_DIRECTORY
+                    names.append(data.cFileName)
+                if not k32.FindNextFileW(h, ctypes.byref(data)):
+                    break
+        finally:
+            k32.FindClose(h)
+        return names
+    with os.scandir(base) as it:
+        return [e.name for e in it if e.is_dir() and e.name.upper().startswith(prefix.upper())]
+
+
 def find_vpo_dirs(vpo: str, sites: tuple[str, ...] = SITES) -> list[Path]:
     """Lot folders named <VPO> or <VPO>_<lcode> in every site's hdmxdata prod/engr area."""
     vpo = vpo.upper()
 
     def scan(base: Path) -> list[Path]:
         try:
-            with os.scandir(base) as it:
-                return [Path(e.path) for e in it if e.is_dir() and (e.name.upper() == vpo or e.name.upper().startswith(vpo + "_"))]
+            return [base / n for n in _list_dirs_matching(base, vpo) if n.upper() == vpo or n.upper().startswith(vpo + "_")]
         except OSError:  # site/area missing or access denied
             return []
 
@@ -560,13 +671,19 @@ def main() -> None:
     ap.add_argument("--csv", help="also write a flat per-point CSV to this path")
     ap.add_argument("--filter", help="only keep shmoo tests whose name matches this regex")
     ap.add_argument("--sites", default=",".join(SITES), help=f"comma-separated sites to search for VPOs (default: {','.join(SITES)})")
+    ap.add_argument("--test-program", action="store_true", help="only report where each input's test program lives (reads headers only; no HTML)")
     args = ap.parse_args()
 
     paths = expand_inputs(args.inputs, tuple(s.strip() for s in args.sites.split(",") if s.strip()))
     if not paths:
         ap.error("no input ituff files found")
+    if args.test_program:
+        firsts = list({p.parent: p for p in reversed(paths)}.values())[::-1]  # chunks in one lot folder share a program
+        print_test_programs(firsts, [read_tp_header(p) for p in firsts])
+        return
     flt = re.compile(args.filter, re.I) if args.filter else None
     data = collect(paths, flt)
+    print_test_programs(paths, [f["header"] for f in data["files"]])
 
     n_shmoo = sum(len(u["shmoos"]) for u in data["units"])
     print(f"Found {len(data['units'])} unit(s), {len(data['tests'])} shmoo test(s), {n_shmoo} shmoo(s).")
