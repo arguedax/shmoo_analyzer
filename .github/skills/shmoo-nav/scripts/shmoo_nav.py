@@ -1,7 +1,9 @@
-"""Shmoo-Nav: extract shmoo results from ituff files and build an interactive HTML viewer.
+r"""Shmoo-Nav: extract shmoo results from ituff files and build an interactive HTML viewer.
 
 Usage:
-    python shmoo_nav.py <ituff[.gz] | directory | glob> [...] [-o out.html] [--csv out.csv] [--filter REGEX]
+    python shmoo_nav.py <VPO | ituff[.gz] | directory | glob> [...] [-o out.html] [--csv out.csv] [--filter REGEX] [--sites sc,cr]
+
+A bare VPO (e.g. I642014CR) is looked up as <HDMX_ROOT>\<site>\intel\hdmxdata\{prod,engr}\<VPO>_* across SITES.
 
 Ituff shmoo records (per unit, per test):
     0_tname_<test>_ShmooParams      0_strgval_<x>^<xs>^<xe>^<xstep>^<y>^<ys>^<ye>^<ystep>_ShmooHub
@@ -18,9 +20,17 @@ import glob
 import gzip
 import html
 import json
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+
+HDMX_ROOT = r"\\amr.corp.intel.com\ec\proj\mdl"
+SITES = ("sc", "cr", "an", "fm", "jf")
+AREAS = ("prod", "engr")
+VPO_RE = re.compile(r"^[A-Z]\d{6}[A-Z0-9]*$", re.I)
+ITUFF_RE = re.compile(r"\.(itf|ituff)(\.gz)?$", re.I)
 
 PRE_UNIT_KEYS = {"prtnm", "eqpprtid", "siteid", "socket", "dvtststdt", "tiuid", "prttesterid"}
 POST_UNIT_KEYS = {"curfbin", "curibin", "binn", "trslt", "dvtsteddt"}
@@ -509,14 +519,35 @@ def write_html(data: dict, out: Path) -> None:
     out.write_text(HTML_TEMPLATE.replace("__TITLE__", title).replace("__DATA__", payload), encoding="utf-8")
 
 
-def expand_inputs(items: list[str]) -> list[Path]:
+def find_vpo_dirs(vpo: str, sites: tuple[str, ...] = SITES) -> list[Path]:
+    """Lot folders named <VPO> or <VPO>_<lcode> in every site's hdmxdata prod/engr area."""
+    vpo = vpo.upper()
+
+    def scan(base: Path) -> list[Path]:
+        try:
+            with os.scandir(base) as it:
+                return [Path(e.path) for e in it if e.is_dir() and (e.name.upper() == vpo or e.name.upper().startswith(vpo + "_"))]
+        except OSError:  # site/area missing or access denied
+            return []
+
+    bases = [Path(HDMX_ROOT) / s / "intel" / "hdmxdata" / a for s in sites for a in AREAS]
+    with ThreadPoolExecutor(max_workers=len(bases)) as ex:
+        return sorted(d for found in ex.map(scan, bases) for d in found)
+
+
+def expand_inputs(items: list[str], sites: tuple[str, ...] = SITES) -> list[Path]:
     paths: list[Path] = []
     for it in items:
         p = Path(it)
         if p.is_dir():
-            paths += sorted(q for q in p.iterdir() if re.search(r"\.(itf|ituff)(\.gz)?$", q.name, re.I))
+            paths += sorted(q for q in p.iterdir() if ITUFF_RE.search(q.name))
         elif p.exists():
             paths.append(p)
+        elif VPO_RE.match(it):
+            dirs = find_vpo_dirs(it, sites)
+            print(f"VPO {it}: " + (", ".join(map(str, dirs)) if dirs else f"no folder found in sites {', '.join(sites)}"))
+            for d in dirs:
+                paths += sorted(q for q in d.iterdir() if ITUFF_RE.search(q.name))
         else:
             paths += [Path(g) for g in sorted(glob.glob(it))]
     return paths
@@ -524,13 +555,14 @@ def expand_inputs(items: list[str]) -> list[Path]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("inputs", nargs="+", help="ituff file(s) (.itf / .itf.gz), directories, or globs")
+    ap.add_argument("inputs", nargs="+", help="VPO ID(s), ituff file(s) (.itf / .itf.gz), directories, or globs")
     ap.add_argument("-o", "--output", help="output HTML path (default: <first input>_shmoo.html in cwd)")
     ap.add_argument("--csv", help="also write a flat per-point CSV to this path")
     ap.add_argument("--filter", help="only keep shmoo tests whose name matches this regex")
+    ap.add_argument("--sites", default=",".join(SITES), help=f"comma-separated sites to search for VPOs (default: {','.join(SITES)})")
     args = ap.parse_args()
 
-    paths = expand_inputs(args.inputs)
+    paths = expand_inputs(args.inputs, tuple(s.strip() for s in args.sites.split(",") if s.strip()))
     if not paths:
         ap.error("no input ituff files found")
     flt = re.compile(args.filter, re.I) if args.filter else None
