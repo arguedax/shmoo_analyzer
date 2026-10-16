@@ -499,6 +499,25 @@ def _find_call(pd: dict, cycle: int) -> tuple[int, int] | None:
     return None
 
 
+def _grid(pd: dict, center: int, fail_pins: set[str], before: int = 14, after: int = 8) -> dict:
+    """Vector window around `center` for the viewer: only pins that compare or toggle in the window, plus fail pins."""
+    ents = pd["entries"]
+    lo, hi = max(0, center - before), min(len(ents), center + after + 1)
+    rows = ents[lo:hi]
+    width = max((len(e["st"]) for e in rows if e["st"]), default=0)
+    names = [pd["pins"][i] if i < len(pd["pins"]) else str(i) for i in range(width)]
+    keep = []
+    for i in range(width):
+        col = {e["st"][i] for e in rows if e["st"] and i < len(e["st"])}
+        if col & set("HL") or len(col - {"X"}) > 1 or names[i].upper() in fail_pins:
+            keep.append(i)
+    labels = {a: name for a, name, _ in pd["labels"]}
+    return {"pins": [names[i] for i in keep], "center": center,
+            "rows": [[a, e["cyc"], e["ln"], e["op"],
+                      "".join(e["st"][i] if i < len(e["st"]) else " " for i in keep) if e["st"] else None,
+                      e["note"], labels.get(a, "")] for a, e in zip(range(lo, hi), rows)]}
+
+
 def locate_vector(pd: dict, addr: int, cycle: int | None, fail_pins: list[str], sub_labels) -> dict:
     """Resolve a LEGEND fail to the pattern's vector, or to a label inside a CALLed subroutine.
 
@@ -508,16 +527,17 @@ def locate_vector(pd: dict, addr: int, cycle: int | None, fail_pins: list[str], 
     """
     ents = pd["entries"]
     fc = None if cycle is None else cycle + 1
+    want = {p.split("::")[-1].upper() for p in fail_pins}
     e = ents[addr] if 0 <= addr < len(ents) else None
     if e and e["kind"] and (fc is None or e["cyc"] is None or e["cyc"] == fc):
         lab = next((x for x in reversed(pd["labels"]) if x[0] <= addr), None)
         comps = _compares(pd, e["st"])
-        want = {p.split("::")[-1].upper() for p in fail_pins}
         return {
             "addr": addr, "line": e["ln"], "op": e["op"], "sub": "",
             "label": lab[1] if lab else "", "label_offset": addr - lab[0] if lab else addr,
             "expect": " ".join(c for c in comps if c.split("=")[0].upper() in want) or " ".join(comps),
             "state": e["state"], "note": e["note"], "context": _context(pd, addr),
+            "fail_pins": sorted(want), "grid": _grid(pd, addr, want),
         }
     hit = _find_call(pd, fc) if fc else None
     if hit:
@@ -533,6 +553,7 @@ def locate_vector(pd: dict, addr: int, cycle: int | None, fail_pins: list[str], 
             "note": f"fail is {into} cycles into the CALL; vector {addr} is a subroutine address"
                     + ("" if labs else " (subroutine labels unavailable)"),
             "context": _context(pd, ci),
+            "fail_pins": sorted(want), "grid": _grid(pd, ci, want),
         }
     where = f"vector {addr}" + (f" / cycle {cycle}" if cycle is not None else "")
     return {"error": f"{where} not found in the pattern's {len(ents)} addresses or inside any CALL"}
@@ -587,9 +608,13 @@ def trace_patterns(data: dict, prod: str) -> None:
         fail_pins = [p for p in re.split(r"[,;\s]+", lg.get("pins", "").split("|")[0]) if p]
         cyc = int(lg["cycle"]) if lg.get("cycle", "").isdigit() else None
         pfolder = Path(pd["file"]).parent
-        lg["trace"] = {**base, "file": pd["file"],
-                       **locate_vector(pd, int(lg["vector"]), cyc, fail_pins,
-                                       lambda: sub_labels_for(pfolder, rec, dom))}
+        t = locate_vector(pd, int(lg["vector"]), cyc, fail_pins, lambda: sub_labels_for(pfolder, rec, dom))
+        if "grid" in t:
+            # Many fails share a window; store each once and reference it by key.
+            gkey = f"{pd['file']}#{t['grid']['center']}"
+            data.setdefault("grids", {})[gkey] = t["grid"]
+            t["grid"] = gkey
+        lg["trace"] = {**base, "file": pd["file"], **t}
 
     seen = set()
     for lg in legs:
@@ -717,6 +742,20 @@ table.lg th{background:#f0f2f5}
 #detail{margin-top:14px;background:var(--panel);border:1px solid var(--bd);border-radius:6px;padding:10px;font-size:12px;display:none}
 #detail pre{white-space:pre-wrap;word-break:break-all;margin:6px 0 0;font:11px Consolas,monospace;background:#f4f5f7;padding:6px;border-radius:4px}
 #detail pre.ctx{white-space:pre;overflow-x:auto;word-break:normal}
+.wvscroll{overflow:auto;max-height:520px;border:1px solid var(--bd);border-radius:4px;margin-top:6px}
+table.wv{border-collapse:collapse;font:10px Consolas,monospace}
+table.wv th,table.wv td{border:1px solid #e3e6eb;padding:0 3px;white-space:nowrap}
+table.wv thead th{position:sticky;top:0;background:#fff;z-index:1}
+table.wv th.pn{writing-mode:vertical-rl;transform:rotate(180deg);padding:4px 0;font-weight:normal;min-width:13px}
+table.wv th.pn.fp{color:#d1242f;font-weight:700}
+table.wv td.s{width:13px;padding:0;text-align:center}
+table.wv td.k-d0{background:#dbe9fb}table.wv td.k-d1{background:#8db8ee}
+table.wv td.k-cH{background:#9be0a6}table.wv td.k-cL{background:#d4f2d9}
+table.wv td.k-x{color:#b0b6c0}table.wv td.k-o{background:#f1e7c8}
+table.wv tr.frow td{border-top:2px solid #d1242f;border-bottom:2px solid #d1242f;font-weight:700}
+table.wv td.fail{background:#d1242f!important;color:#fff;outline:2px solid #7a0d14;outline-offset:-2px}
+table.wv tr.lab td{background:#f4f5f7;color:var(--acc);font-weight:700;white-space:normal;word-break:break-all;max-width:0}
+table.wv td.ad{color:var(--mut);text-align:right}table.wv td.nt{color:var(--mut)}
 table.ov{border-collapse:collapse;font-size:11px}
 table.ov th,table.ov td{border:1px solid var(--bd);padding:3px 6px;white-space:nowrap}
 table.ov th{background:#f0f2f5;position:sticky;top:0}
@@ -847,7 +886,36 @@ function showDetail(u,s,i,j){
         (t.sub?`Location: inside subroutine ${t.sub}, called at file line ${t.line}\nLabel   : ${t.label?t.label+" + "+t.label_offset+" vectors (subroutine address "+t.addr+")":"(no subroutine label)"}\nNote    : ${t.note}`:
         `Vector  : ${t.addr} at file line ${t.line}  ${t.op||"V"}\nLabel   : ${t.label?t.label+" + "+t.label_offset+" vectors":"(none before this vector)"}\nExpected: ${t.expect||"(no compares on this vector)"}`+
         (t.state||t.note?`\nState   : ${t.state||""}\nNote    : ${t.note||""}`:""))));
-      if(!t.error)d.append(el("pre","ctx","  addr     cycle  line    opcode                         compares\n"+t.context.join("\n")))}}
+      if(!t.error)d.append(el("pre","ctx","  addr     cycle  line    opcode                         compares\n"+t.context.join("\n")));
+      if(!t.error&&t.grid&&DATA.grids&&DATA.grids[t.grid])d.append(waveGrid(DATA.grids[t.grid],t))}}
+
+function waveGrid(g,t){
+  const box=el("div");
+  box.append(el("h4",null,"Vector view"+(t.sub?` (fail is inside ${t.sub} at ${t.label}+${t.label_offset}; failing pins marked F on the CALL row)`:"")));
+  const fp=new Set((t.fail_pins||[]).map(p=>p.toUpperCase()));
+  const kind=ch=>({"0":"d0","1":"d1","H":"cH","L":"cL","X":"x"}[ch]||"o");
+  const tb=el("table","wv"),th=el("thead"),hr=el("tr");
+  ["addr","cycle","line","op"].forEach(h=>hr.append(el("th",null,h)));
+  g.pins.forEach(p=>{const c=el("th","pn"+(fp.has(p.toUpperCase())?" fp":""),p);c.title=p;hr.append(c)});
+  hr.append(el("th",null,"note"));th.append(hr);tb.append(th);
+  const body=el("tbody");let failCell=null;
+  g.rows.forEach(([a,c,ln,op,st,note,lab])=>{
+    if(lab){const lr=el("tr","lab"),td=el("td",null,lab+":");td.colSpan=g.pins.length+5;lr.append(td);body.append(lr)}
+    const tr=el("tr",a===g.center?"frow":"");
+    tr.append(el("td","ad",a),el("td","ad",c==null?"":c),el("td","ad","L"+ln),el("td",null,op||""));
+    if(st==null&&a===g.center&&t.sub){
+      g.pins.forEach(p=>{const f=fp.has(p.toUpperCase()),td=el("td","s"+(f?" fail":""),f?"F":"");
+        if(f){td.title=`${p}: failing strobe is inside ${t.sub} at ${t.label}+${t.label_offset} (subroutine vector ${t.addr})`;failCell=failCell||td}tr.append(td)})}
+    else if(st==null){const td=el("td","nt",op?"":"serial vector (no per-pin states)");td.colSpan=g.pins.length;tr.append(td)}
+    else [...st].forEach((ch,i)=>{const td=el("td","s k-"+kind(ch),ch);td.title=`${g.pins[i]} = ${ch}  (vector ${a})`;
+      if(a===g.center&&!t.sub&&fp.has(g.pins[i].toUpperCase())){td.classList.add("fail");failCell=failCell||td}tr.append(td)});
+    tr.append(el("td","nt",note||""));body.append(tr);
+  });
+  tb.append(body);const sc=el("div","wvscroll");sc.append(tb);box.append(sc);
+  box.append(el("div","hint","Pins run left to right, vectors top to bottom. 0/1 = drive, H/L = strobe (compare), X = don't care. Red = the failing pin at the failing vector; only pins that strobe or toggle in this window are shown."));
+  if(failCell)requestAnimationFrame(()=>{sc.scrollLeft=failCell.offsetLeft-sc.clientWidth/2;sc.scrollTop=failCell.offsetTop-sc.clientHeight/2});
+  return box;
+}
 }
 
 function shmooCard(u,t){
