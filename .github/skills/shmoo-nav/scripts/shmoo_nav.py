@@ -8,13 +8,17 @@ A bare VPO (e.g. I642014CR) is looked up as <HDMX_ROOT>\<site>\intel\hdmxdata\{p
 Ituff shmoo records (per unit, per test):
     0_tname_<test>_ShmooParams      0_strgval_<x>^<xs>^<xe>^<xstep>^<y>^<ys>^<ye>^<ystep>_ShmooHub
     0_tname_<test>_ShmooResults     0_strgval_<row0>_<row1>_...   (row = Y step from Y start, char = X step)
-    0_tname_<test>^LEGEND^<C>       0_strgval_<pattern>|<idx>:<plist>:<domain>(<vec>,<cyc>,..):<pins>
+    0_tname_<test>^LEGEND^<C>       0_strgval_<pattern>|<idx>:<plist>:<domain>(<cyc>,<vec>,..):<pins>
 '*' = pass; any other character = failure described by the matching LEGEND entry.
+
+With --trace-patterns each failing pattern is looked up in FLASH, its converted .hdmt.data is read over samba,
+and the failing vector address is resolved to its file line, opcode, expected pin states and nearest label.
 """
 
 from __future__ import annotations
 
 import argparse
+import bz2
 import csv
 import glob
 import gzip
@@ -22,6 +26,9 @@ import html
 import json
 import os
 import re
+import struct
+import urllib.request
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +45,10 @@ HEADER_KEYS = {"lotid", "prgnm", "prdct", "sysid", "tempr", "processstep", "faci
 TP_ATTRS = {"tplpath", "stplpath", "socpath", "envpath", "tpbasepath"}
 LEGEND_RE = re.compile(r"^(?P<pat>[^|]*)\|(?P<idx>\d+):(?P<rest>.*)$")
 LOC_RE = re.compile(r":(?P<dom>[A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)*)\((?P<loc>[^)]*)\):(?P<pins>.*)$")
+
+FLASH_URL = "https://mdcx-tvpv-flash.intel.com/mcp"
+FLASH_PATH_PREFIX = "/p/pde/tvpv/"
+LABEL_RE = re.compile(r"^([A-Za-z_]\w*):\s*$")
 
 
 def open_ituff(path: Path):
@@ -58,8 +69,8 @@ def parse_legend(raw: str) -> dict:
         out["plist"] = rest[1:lm.start()]
         out["domain"] = lm["dom"]
         loc = lm["loc"].split(",")
-        out["vector"] = loc[0] if loc else ""
-        out["cycle"] = loc[1] if len(loc) > 1 else ""
+        out["cycle"] = loc[0] if loc else ""
+        out["vector"] = loc[1] if len(loc) > 1 else ""
         out["pins"] = lm["pins"]
     else:
         out["plist"] = m["rest"]
@@ -292,6 +303,312 @@ def print_test_programs(paths: list[Path], headers: list[dict]) -> None:
             print("  no tplpath recorded in this ituff")
 
 
+def flash_call(tool: str, arguments: dict) -> dict:
+    """Call a FLASH MCP tool over streamable HTTP and return its structuredContent."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # intranet host: bypass proxy
+    session: str | None = None
+
+    def rpc(method: str, params: dict, rid: int | None = None) -> dict | None:
+        nonlocal session
+        body = {"jsonrpc": "2.0", "method": method, "params": params}
+        if rid is not None:
+            body["id"] = rid
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+        if session:
+            headers["Mcp-Session-Id"] = session
+        req = urllib.request.Request(FLASH_URL, data=json.dumps(body).encode(), method="POST", headers=headers)
+        with opener.open(req, timeout=180) as r:
+            session = r.headers.get("Mcp-Session-Id") or session
+            raw = r.read().decode("utf-8", "replace")
+        for line in raw.splitlines():
+            if line.startswith("data:"):
+                return json.loads(line[5:])
+        return json.loads(raw) if raw.strip() else None
+
+    rpc("initialize", {"protocolVersion": "2025-03-26", "capabilities": {},
+                       "clientInfo": {"name": "shmoo-nav", "version": "1"}}, 1)
+    rpc("notifications/initialized", {})
+    res = rpc("tools/call", {"name": tool, "arguments": arguments}, 2) or {}
+    result = res.get("result") or {}
+    if res.get("error") or result.get("isError"):
+        msg = res.get("error") or " ".join(c.get("text", "") for c in result.get("content", []))
+        raise RuntimeError(f"FLASH {tool} failed: {msg}")
+    return result.get("structuredContent") or {}
+
+
+def flash_lookup_patterns(names: set[str], prod: str) -> dict[str, dict]:
+    """FLASH pattern records by name; the most recent valid conversion wins."""
+    out: dict[str, dict] = {}
+    names_l = sorted(names)
+    for i in range(0, len(names_l), 50):
+        res = flash_call("flash_search", {"prod": prod, "cmd": "pat", "query_mode": "name",
+                                          "query": names_l[i:i + 50], "verbose": True, "limit": 1000})
+        for r in res.get("result", []):
+            if not r.get("valid", True):
+                continue
+            cur = out.get(r["name"])
+            if cur is None or str(r.get("requested_date", "")) > str(cur.get("requested_date", "")):
+                out[r["name"]] = r
+    return out
+
+
+_disk_hits: dict[str, str] = {}
+
+
+def resolve_flash_dir(unix_file: str, site: str) -> Path | None:
+    """Map FLASH's /p/pde/tvpv/<rel> to the samba disk that holds it: \\\\samba.<site>.intel.com\\nfs\\site\\disks\\mfg_tvpv_*\\<rel>."""
+    if not unix_file.startswith(FLASH_PATH_PREFIX) or not site:
+        return None
+    rel_dir = unix_file[len(FLASH_PATH_PREFIX):].rsplit("/", 1)[0].replace("/", "\\")
+    root = Path(rf"\\samba.{site.lower()}.intel.com\nfs\site\disks")
+    if site in _disk_hits:
+        cand = root / _disk_hits[site] / rel_dir
+        if cand.is_dir():
+            return cand
+    try:
+        disks = _list_dirs_matching(root, "mfg_tvpv_")
+    except OSError:
+        return None
+
+    def probe(disk: str) -> Path | None:
+        try:
+            return root / disk / rel_dir if (root / disk / rel_dir).is_dir() else None
+        except OSError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=32) as ex:
+        for disk, hit in zip(disks, ex.map(probe, disks)):
+            if hit:
+                _disk_hits[site] = disk
+                return hit
+    return None
+
+
+def read_pattern_data(folder: Path, name: str, domain: str) -> dict | None:
+    """Parse <name>_<domain>.hdmt.data[.bz2]: one vector-memory address per vector or instruction line.
+
+    Vector lines end with comment fields: # t_start # t_end # address # cycle # tap_state # note
+    """
+    path = next((p for p in (folder / f"{name}_{domain}.hdmt.data.bz2", folder / f"{name}_{domain}.hdmt.data")
+                 if p.exists()), None)
+    if path is None:
+        return None
+    raw = path.read_bytes()
+    lines = (bz2.decompress(raw) if path.suffix == ".bz2" else raw).decode("utf-8", "replace").splitlines()
+
+    header = [l for l in lines if l.startswith("#")]
+    entries: list[dict] = []  # ln, op, st (parallel pin states or None), cyc, state, note, kind
+    labels: list[tuple[int, str, int]] = []  # (address, label, file line)
+    pins: list[str] = []
+    for ln, l in enumerate(lines, 1):
+        s = l.strip()
+        if not s or s.startswith("#"):
+            continue
+        lm = LABEL_RE.match(s)
+        if lm:
+            labels.append((len(entries), lm[1], ln))
+            continue
+        m = re.search(r"\{\s*(\w+)\s*\{\s*\w+=([^\s;}]+)", l)
+        if not m:
+            entries.append({"ln": ln, "op": s, "st": None, "cyc": None, "state": "", "note": "", "kind": ""})
+            continue
+        op = l[:m.start()].strip()
+        kind = m[1]
+        if not pins and not op and kind != "S":
+            # Pin names are written vertically in the header comments, aligned to unprefixed state columns.
+            pins = ["".join(h[c] if c < len(h) else " " for h in header).strip()
+                    for c in range(m.start(2), m.end(2))]
+        f = [x.strip() for x in l.split("#")[1:]]
+        entries.append({"ln": ln, "op": op, "st": m[2] if kind != "S" else None,
+                        "cyc": int(f[3]) if len(f) > 3 and f[3].isdigit() else None,
+                        "state": f[4] if len(f) > 4 else "", "note": f[5] if len(f) > 5 else "", "kind": kind})
+    return {"file": str(path), "pins": pins, "entries": entries, "labels": labels}
+
+
+def read_pinobj_labels(path: Path, domains: list[str]) -> dict[str, list[tuple[int, str]]]:
+    """Label tables of a compiled .pinObj, per domain.
+
+    Layout: plain header naming the domains in order, then per domain a zlib label block
+    (u32 count, then <name>\\n<u64 address> each) followed by vector data blocks.
+    """
+    raw = path.read_bytes()
+    starts = [m.start() for m in re.finditer(rb"\x78[\x01\x5e\x9c\xda]", raw)]
+    if not starts:
+        return {}
+    hdr = raw[:starts[0]].decode("latin1")
+    tables: list[list[tuple[int, str]]] = []
+    pos = starts[0]
+    while pos < len(raw):
+        d = zlib.decompressobj()
+        try:
+            blk = d.decompress(raw[pos:])
+        except zlib.error:
+            nxt = [s for s in starts if s > pos]
+            if not nxt:
+                break
+            pos = nxt[0]
+            continue
+        pos = len(raw) - len(d.unused_data)
+        try:
+            n, p, tab = struct.unpack_from("<I", blk, 0)[0], 4, []
+            for _ in range(n):
+                e = blk.index(b"\n", p, p + 4096)
+                tab.append((struct.unpack_from("<Q", blk, e + 1)[0], blk[p:e].decode("ascii")))
+                p = e + 9
+            if n and p == len(blk) and all(t[1].isidentifier() for t in tab):
+                tables.append(sorted(tab))
+        except (struct.error, ValueError, UnicodeDecodeError):
+            pass
+    order = sorted((hdr.find(d), d) for d in domains if d in hdr)
+    return dict(zip((d for _, d in order), tables))
+
+
+def _compares(pd: dict, states: str | None) -> list[str]:
+    if not states:
+        return []
+    return [f"{pd['pins'][i] if i < len(pd['pins']) else i}={c}" for i, c in enumerate(states) if c in "HL"]
+
+
+def _context(pd: dict, center: int, before: int = 6, after: int = 4) -> list[str]:
+    out = []
+    for a in range(max(0, center - before), min(len(pd["entries"]), center + after)):
+        e = pd["entries"][a]
+        for la, lname, lln in pd["labels"]:
+            if la == a:
+                out.append(f"                    L{lln:<6} {lname}:")
+        body = " ".join(_compares(pd, e["st"])) or ("serial" if e["kind"] == "S" else "-" if e["kind"] else "")
+        extra = " ".join(x for x in (e["state"], e["note"]) if x)
+        cyc = "" if e["cyc"] is None else e["cyc"]
+        out.append(f"{'>>' if a == center else '  '} {a:6} {cyc:>8}  L{e['ln']:<6} {e['op'][:30]:<30} {body[:100]}"
+                   + (f"   [{extra}]" if extra else ""))
+    return out
+
+
+def _find_call(pd: dict, cycle: int) -> tuple[int, int] | None:
+    """(CALL entry index, cycles into the call) if the 1-based file cycle falls between a CALL's surrounding vectors."""
+    prev: dict | None = None
+    call: int | None = None
+    for i, e in enumerate(pd["entries"]):
+        if e["cyc"] is None:
+            if e["op"].startswith("CALL"):
+                call = i
+            continue
+        if call is not None and prev is not None and prev["cyc"] < cycle < e["cyc"]:
+            return call, cycle - prev["cyc"]
+        prev, call = e, None
+    return None
+
+
+def locate_vector(pd: dict, addr: int, cycle: int | None, fail_pins: list[str], sub_labels) -> dict:
+    """Resolve a LEGEND fail to the pattern's vector, or to a label inside a CALLed subroutine.
+
+    LEGEND cycles are 0-based, the data file's cycle comments 1-based. The vector at `addr` is only
+    accepted if its cycle matches; otherwise the cycle is looked up inside CALLs and `addr` read as a
+    subroutine address (sub_labels: callable returning [(address, label)] for this domain).
+    """
+    ents = pd["entries"]
+    fc = None if cycle is None else cycle + 1
+    e = ents[addr] if 0 <= addr < len(ents) else None
+    if e and e["kind"] and (fc is None or e["cyc"] is None or e["cyc"] == fc):
+        lab = next((x for x in reversed(pd["labels"]) if x[0] <= addr), None)
+        comps = _compares(pd, e["st"])
+        want = {p.split("::")[-1].upper() for p in fail_pins}
+        return {
+            "addr": addr, "line": e["ln"], "op": e["op"], "sub": "",
+            "label": lab[1] if lab else "", "label_offset": addr - lab[0] if lab else addr,
+            "expect": " ".join(c for c in comps if c.split("=")[0].upper() in want) or " ".join(comps),
+            "state": e["state"], "note": e["note"], "context": _context(pd, addr),
+        }
+    hit = _find_call(pd, fc) if fc else None
+    if hit:
+        ci, into = hit
+        op = ents[ci]["op"]
+        target = op.split(None, 1)[1].strip() if " " in op else op
+        labs = sub_labels() or []
+        lab = next((x for x in reversed(labs) if x[0] <= addr), None)
+        return {
+            "addr": addr, "line": ents[ci]["ln"], "op": op, "sub": target,
+            "label": lab[1] if lab else "", "label_offset": addr - lab[0] if lab else addr,
+            "expect": "", "state": "",
+            "note": f"fail is {into} cycles into the CALL; vector {addr} is a subroutine address"
+                    + ("" if labs else " (subroutine labels unavailable)"),
+            "context": _context(pd, ci),
+        }
+    where = f"vector {addr}" + (f" / cycle {cycle}" if cycle is not None else "")
+    return {"error": f"{where} not found in the pattern's {len(ents)} addresses or inside any CALL"}
+
+
+def trace_patterns(data: dict, prod: str) -> None:
+    """Attach a 'trace' dict to every failing LEGEND entry that has a vector address."""
+    legs = [lg for u in data["units"] for s in u["shmoos"].values() for lg in s["legend"].values()
+            if lg.get("pattern") and lg.get("vector", "").isdigit()]
+    names = {lg["pattern"] for lg in legs}
+    if not names:
+        return
+    print(f"Tracing {len(names)} failing pattern(s) through FLASH ({prod}) ...")
+    try:
+        recs = flash_lookup_patterns(names, prod)
+    except (OSError, RuntimeError, ValueError) as e:
+        print(f"  FLASH lookup failed: {e}")
+        return
+    cache: dict[tuple[str, str], dict | str] = {}
+    sub_cache: dict[Path, dict] = {}
+
+    def sub_labels_for(folder: Path, rec: dict, dom: str) -> list[tuple[int, str]]:
+        # The pattern folder carries a copy of its common subroutine .pinObj (FLASH 'sub').
+        name = (rec.get("sub") or "").rsplit("/", 1)[-1]
+        p = folder / name if name else None
+        if p is None or not p.exists():
+            return []
+        if p not in sub_cache:
+            try:
+                sub_cache[p] = read_pinobj_labels(p, list(rec.get("vecmem") or {}))
+            except OSError:
+                sub_cache[p] = {}
+        return sub_cache[p].get(dom, [])
+
+    for lg in legs:
+        rec = recs.get(lg["pattern"])
+        if not rec:
+            lg["trace"] = {"error": f"pattern not found in FLASH ({prod})"}
+            continue
+        dom = lg["domain"].split("::")[-1]
+        key = (lg["pattern"], dom)
+        if key not in cache:
+            folder = resolve_flash_dir(rec.get("path", ""), rec.get("site", ""))
+            pd = read_pattern_data(folder, lg["pattern"], dom) if folder else None
+            cache[key] = pd or (f"no {dom} data file in {folder}" if folder
+                                else f"cannot reach {rec.get('path', '')} (site {rec.get('site', '?')}) over samba")
+        pd = cache[key]
+        base = {"flash_path": rec.get("path", ""), "tid": rec.get("tid", ""), "lineitem": rec.get("lineitem", "")}
+        if isinstance(pd, str):
+            lg["trace"] = {**base, "error": pd}
+            continue
+        fail_pins = [p for p in re.split(r"[,;\s]+", lg.get("pins", "").split("|")[0]) if p]
+        cyc = int(lg["cycle"]) if lg.get("cycle", "").isdigit() else None
+        pfolder = Path(pd["file"]).parent
+        lg["trace"] = {**base, "file": pd["file"],
+                       **locate_vector(pd, int(lg["vector"]), cyc, fail_pins,
+                                       lambda: sub_labels_for(pfolder, rec, dom))}
+
+    seen = set()
+    for lg in legs:
+        t = lg.get("trace", {})
+        k = (lg["pattern"], lg["domain"], lg["vector"], lg["cycle"])
+        if k in seen:
+            continue
+        seen.add(k)
+        print(f"  {lg['pattern']}  {lg['domain']} vec {lg['vector']} cyc {lg['cycle']}:")
+        if t.get("error"):
+            print(f"    {t['error']}")
+        elif t.get("sub"):
+            print(f"    line {t['line']} {t['op']}  ->  {t['label']}+{t['label_offset']} inside the subroutine")
+        else:
+            extra = " ".join(x for x in (t.get("state"), t.get("note")) if x)
+            print(f"    line {t['line']} {t['op'] or 'V'}  {t['label']}+{t['label_offset']}  expects {t['expect'] or '-'}"
+                  + (f"  [{extra}]" if extra else ""))
+
+
 def collect(paths: list[Path], name_filter: re.Pattern | None) -> dict:
     files, units, tests = [], [], {}
     for fi, p in enumerate(paths):
@@ -329,7 +646,8 @@ def write_csv(data: dict, out: Path) -> None:
     with open(out, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["file", "visualid", "site", "unit_label", "test", "x_name", "x", "y_name", "y",
-                    "result", "pattern", "plist", "vector", "cycle", "pins"])
+                    "result", "pattern", "plist", "vector", "cycle", "pins",
+                    "src_file", "src_line", "src_subroutine", "src_label", "src_label_offset", "src_expect", "src_note"])
         for u in data["units"]:
             fname = data["files"][u["file"]]["name"]
             for tkey, s in u["shmoos"].items():
@@ -337,10 +655,13 @@ def write_csv(data: dict, out: Path) -> None:
                     for j, xv in enumerate(s["x"]):
                         c = s["rows"][i][j]
                         lg = s["legend"].get(c, {}) if c != "*" else {}
+                        t = lg.get("trace") or {}
                         w.writerow([fname, u["info"].get("visualid", ""), u["info"].get("siteid", ""), u["label"],
                                     tkey, s["xname"], xv, s["yname"], yv, "PASS" if c == "*" else c,
                                     lg.get("pattern", ""), lg.get("plist", ""), lg.get("vector", ""),
-                                    lg.get("cycle", ""), lg.get("pins", "")])
+                                    lg.get("cycle", ""), lg.get("pins", ""), t.get("file", ""), t.get("line", ""),
+                                    t.get("sub", ""), t.get("label", ""), t.get("label_offset", ""), t.get("expect", ""),
+                                    " ".join(x for x in (t.get("state"), t.get("note"), t.get("error")) if x)])
 
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -395,6 +716,7 @@ table.lg th{background:#f0f2f5}
 #tip b{color:#ffd166}
 #detail{margin-top:14px;background:var(--panel);border:1px solid var(--bd);border-radius:6px;padding:10px;font-size:12px;display:none}
 #detail pre{white-space:pre-wrap;word-break:break-all;margin:6px 0 0;font:11px Consolas,monospace;background:#f4f5f7;padding:6px;border-radius:4px}
+#detail pre.ctx{white-space:pre;overflow-x:auto;word-break:normal}
 table.ov{border-collapse:collapse;font-size:11px}
 table.ov th,table.ov td{border:1px solid var(--bd);padding:3px 6px;white-space:nowrap}
 table.ov th{background:#f0f2f5;position:sticky;top:0}
@@ -503,7 +825,9 @@ function showTip(ev,u,s,i,j){
   const add=(k,v)=>{if(v===""||v==null)return;const r=el("div");r.append(el("b",null,k+": "),document.createTextNode(v));tip.append(r)};
   add("Unit",u.label);add(s.xname,fmt(s.x[j],s.xname));add(s.yname,fmt(s.y[i],s.yname));
   if(ch==="*")add("Result","PASS");else{const lg=legendInfo(s,ch);add("Result","FAIL ("+ch+")");add("Pattern",lg.pattern);add("Plist",lg.plist);
-    add("Fail vector/cycle",lg.vector?lg.vector+" / "+lg.cycle:"");add("Pins",lg.pins)}
+    add("Fail vector/cycle",lg.vector?lg.vector+" / "+lg.cycle:"");add("Pins",lg.pins);
+    const t=lg.trace;if(t&&!t.error){add("Source",t.sub?`${t.sub}: ${t.label}+${t.label_offset} (CALL at line ${t.line})`:`line ${t.line}${t.label?"  "+t.label+"+"+t.label_offset:""}`);
+      add("Expected",t.expect);add("Captures",t.sub?"":[t.state,t.note].filter(Boolean).join("  "))}}
   tip.style.display="block";moveTip(ev);
 }
 function moveTip(ev){const t=$("#tip");const w=t.offsetWidth,h=t.offsetHeight;
@@ -515,7 +839,15 @@ function showDetail(u,s,i,j){
   d.append(el("h4",null,`${u.label}  —  ${state.test}`));
   d.append(el("div",null,`${s.xname} = ${fmt(s.x[j],s.xname)},  ${s.yname} = ${fmt(s.y[i],s.yname)}  →  ${ch==="*"?"PASS":"FAIL ("+ch+")"}`));
   if(ch!=="*"){const lg=legendInfo(s,ch);
-    d.append(el("pre",null,`Pattern : ${lg.pattern}\nPlist   : ${lg.plist}\nDomain  : ${lg.domain||""}\nVector  : ${lg.vector}\nCycle   : ${lg.cycle}\nPins    : ${lg.pins}\n\nRaw     : ${lg.raw}`));}
+    d.append(el("pre",null,`Pattern : ${lg.pattern}\nPlist   : ${lg.plist}\nDomain  : ${lg.domain||""}\nVector  : ${lg.vector}\nCycle   : ${lg.cycle}\nPins    : ${lg.pins}\n\nRaw     : ${lg.raw}`));
+    const t=lg.trace;
+    if(t){d.append(el("h4",null,"Pattern source"));
+      d.append(el("pre",null,t.error?`FLASH   : ${t.flash_path||""}\n${t.error}`:
+        `File    : ${t.file}\nFLASH   : ${t.flash_path}\nTID     : ${t.tid}   line item: ${t.lineitem}\n`+
+        (t.sub?`Location: inside subroutine ${t.sub}, called at file line ${t.line}\nLabel   : ${t.label?t.label+" + "+t.label_offset+" vectors (subroutine address "+t.addr+")":"(no subroutine label)"}\nNote    : ${t.note}`:
+        `Vector  : ${t.addr} at file line ${t.line}  ${t.op||"V"}\nLabel   : ${t.label?t.label+" + "+t.label_offset+" vectors":"(none before this vector)"}\nExpected: ${t.expect||"(no compares on this vector)"}`+
+        (t.state||t.note?`\nState   : ${t.state||""}\nNote    : ${t.note||""}`:""))));
+      if(!t.error)d.append(el("pre","ctx","  addr     cycle  line    opcode                         compares\n"+t.context.join("\n")))}}
 }
 
 function shmooCard(u,t){
@@ -672,6 +1004,9 @@ def main() -> None:
     ap.add_argument("--filter", help="only keep shmoo tests whose name matches this regex")
     ap.add_argument("--sites", default=",".join(SITES), help=f"comma-separated sites to search for VPOs (default: {','.join(SITES)})")
     ap.add_argument("--test-program", action="store_true", help="only report where each input's test program lives (reads headers only; no HTML)")
+    ap.add_argument("--trace-patterns", action="store_true",
+                    help="look up failing patterns in FLASH and resolve each fail vector to its .hdmt.data line, label and expected pins")
+    ap.add_argument("--flash-prod", default="DIO", help="FLASH product for --trace-patterns (default: DIO)")
     args = ap.parse_args()
 
     paths = expand_inputs(args.inputs, tuple(s.strip() for s in args.sites.split(",") if s.strip()))
@@ -689,6 +1024,8 @@ def main() -> None:
     print(f"Found {len(data['units'])} unit(s), {len(data['tests'])} shmoo test(s), {n_shmoo} shmoo(s).")
     if not n_shmoo:
         return
+    if args.trace_patterns:
+        trace_patterns(data, args.flash_prod)
 
     base = re.sub(r"\.(itf|ituff)(\.gz)?$", "", paths[0].name, flags=re.I)
     out = Path(args.output) if args.output else Path.cwd() / f"{base}_shmoo.html"
