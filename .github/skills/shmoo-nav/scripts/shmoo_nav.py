@@ -45,6 +45,7 @@ HEADER_KEYS = {"lotid", "prgnm", "prdct", "sysid", "tempr", "processstep", "faci
 TP_ATTRS = {"tplpath", "stplpath", "socpath", "envpath", "tpbasepath"}
 LEGEND_RE = re.compile(r"^(?P<pat>[^|]*)\|(?P<idx>\d+):(?P<rest>.*)$")
 LOC_RE = re.compile(r":(?P<dom>[A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)*)\((?P<loc>[^)]*)\):(?P<pins>.*)$")
+COORD_LEGEND_RE = re.compile(r"^\[(?P<x>[^\\^]+)\^(?P<y>[^\\^]+)\^(?P<index>\d+)\]$")
 
 FLASH_URL = "https://mdcx-tvpv-flash.intel.com/mcp"
 FLASH_PATH_PREFIX = "/p/pde/tvpv/"
@@ -58,7 +59,7 @@ def open_ituff(path: Path):
 
 
 def parse_legend(raw: str) -> dict:
-    out = {"raw": raw, "pattern": raw, "plist": "", "domain": "", "vector": "", "cycle": "", "pins": ""}
+    out = {"raw": raw, "pattern": raw, "plist": "", "domain": "", "vector": "", "cycle": "", "pins": "", "suffix": ""}
     m = LEGEND_RE.match(raw)
     if not m:
         return out
@@ -71,10 +72,52 @@ def parse_legend(raw: str) -> dict:
         loc = lm["loc"].split(",")
         out["cycle"] = loc[0] if loc else ""
         out["vector"] = loc[1] if len(loc) > 1 else ""
-        out["pins"] = lm["pins"]
+        out["pins"], _, out["suffix"] = lm["pins"].partition("|")
     else:
         out["plist"] = m["rest"]
     return out
+
+
+def parse_legend_coordinate(key: str) -> tuple[float, float, int] | None:
+    match = COORD_LEGEND_RE.fullmatch(key)
+    if not match:
+        return None
+    try:
+        return float(match["x"]), float(match["y"]), int(match["index"])
+    except ValueError:
+        return None
+
+
+def axis_index(axis: list[float], value: float) -> int | None:
+    if not axis:
+        return None
+    index = min(range(len(axis)), key=lambda i: abs(axis[i] - value))
+    steps = [abs(axis[i + 1] - axis[i]) for i in range(len(axis) - 1)]
+    steps = [step for step in steps if step > 0]
+    tolerance = max(min(steps) * 1e-6 if steps else 0, abs(value) * 1e-12, 1e-15)
+    return index if abs(axis[index] - value) <= tolerance else None
+
+
+def map_coordinate_legends(legend: dict, x: list[float], y: list[float]) -> dict:
+    cells: dict[str, list[dict]] = {}
+    unmatched = []
+    for key, entry in legend.items():
+        coord = parse_legend_coordinate(key)
+        if coord is None:
+            continue
+        xv, yv, index = coord
+        xi, yi = axis_index(x, xv), axis_index(y, yv)
+        if xi is None or yi is None:
+            unmatched.append(key)
+            continue
+        item = entry
+        item.update(key=key, index=index)
+        cells.setdefault(f"{yi},{xi}", []).append(item)
+    if unmatched:
+        raise ValueError(f"{len(unmatched)} coordinate legend(s) do not match the shmoo axes: {unmatched[0]}")
+    for entries in cells.values():
+        entries.sort(key=lambda item: item["index"])
+    return cells
 
 
 def axis_values(start: float, stop: float, step: float) -> list[float]:
@@ -99,36 +142,55 @@ def parse_params(raw: str) -> dict | None:
     }
 
 
-def build_grid(params: dict | None, results: str) -> tuple[list[float], list[float], list[str], str, str]:
-    """Return (x, y, rows, xname, yname); rows[i][j] = result at y[i], x[j]."""
+def build_grid(params: dict | None, results: str, coordinate_legends: dict | None = None) -> tuple[list[float], list[float], list[list[str]], str, str]:
+    """Return an X/Y grid, decoding coordinate-keyed decimal failure counts."""
     rows = results.split("_")
+    if coordinate_legends is not None and params is None:
+        raise ValueError("coordinate legends require ShmooParams axes")
     if params:
         x, y = params["x"], params["y"]
+        if coordinate_legends is not None:
+            if not x or len(rows) != len(y):
+                raise ValueError("coordinate legends require matching ShmooParams axes and result rows")
+            legends = map_coordinate_legends(coordinate_legends, x, y)
+            cells = [
+                [str(len(legends[f"{i},{j}"])) if f"{i},{j}" in legends else "*" for j in range(len(x))]
+                for i in range(len(y))
+            ]
+            for i, row in enumerate(rows):
+                expected = "".join(cells[i])
+                if row != expected:
+                    raise ValueError(f"result row {i} does not match coordinate legend counts: {row!r} != {expected!r}")
+            return x, y, cells, params["xname"], params["yname"]
         if len(rows) == len(y) and all(len(r) == len(x) for r in rows):
-            return x, y, rows, params["xname"], params["yname"]
+            return x, y, [list(row) for row in rows], params["xname"], params["yname"]
         if len(rows) == len(x) and all(len(r) == len(y) for r in rows):
-            return x, y, ["".join(r[i] for r in rows) for i in range(len(y))], params["xname"], params["yname"]
+            return x, y, [[rows[j][i] for j in range(len(x))] for i in range(len(y))], params["xname"], params["yname"]
     width = max((len(r) for r in rows), default=0)
     rows = [r.ljust(width, "?") for r in rows]
-    return list(range(width)), list(range(len(rows))), rows, "X index", "Y index"
+    return list(range(width)), list(range(len(rows))), [list(row) for row in rows], "X index", "Y index"
 
 
-def summarize(y: list[float], rows: list[str]) -> dict:
+def is_pass_cell(cell: str) -> bool:
+    return bool(cell) and all(symbol == "*" for symbol in cell)
+
+
+def summarize(y: list[float], rows: list[list[str]]) -> dict:
     """Per X column, lowest Y from which every higher Y point passes (None if top fails)."""
     ncol = len(rows[0]) if rows else 0
     col_min = []
     for j in range(ncol):
         best = None
         for i in range(len(rows) - 1, -1, -1):
-            if rows[i][j] != "*":
+            if not is_pass_cell(rows[i][j]):
                 break
             best = y[i]
         col_min.append(best)
-    fails = sum(c != "*" for r in rows for c in r)
+    fails = sum(not is_pass_cell(cell) for row in rows for cell in row)
     passes = [v for v in col_min if v is not None]
     return {"col_min": col_min, "min_pass": min(passes) if passes else None,
             "max_pass": max(passes) if passes else None, "fails": fails,
-            "total": sum(len(r) for r in rows)}
+            "total": sum(len(row) for row in rows)}
 
 
 def parse_ituff(path: Path, name_filter: re.Pattern | None) -> dict:
@@ -651,12 +713,16 @@ def collect(paths: list[Path], name_filter: re.Pattern | None) -> dict:
                 rec = u["shmoos"][k]
                 if rec["results"] is None:
                     continue
-                x, y, rows, xname, yname = build_grid(rec["params"], rec["results"])
+                coordinate_legends = any(parse_legend_coordinate(key) for key in rec["legend"])
+                x, y, rows, xname, yname = build_grid(
+                    rec["params"], rec["results"], rec["legend"] if coordinate_legends else None)
                 tkey = rec["test"] + (f" [{rec['die']}]" if rec["die"] else "")
                 tests.setdefault(tkey, {"test": rec["test"], "die": rec["die"]})
                 shmoos[tkey] = {
                     "x": x, "y": y, "rows": rows, "xname": xname, "yname": yname,
                     "legend": rec["legend"], "params_raw": rec.get("params_raw", ""),
+                    "legend_mode": "coordinate" if coordinate_legends else "character",
+                    "cell_legend": map_coordinate_legends(rec["legend"], x, y) if coordinate_legends else {},
                     "summary": summarize(y, rows),
                 }
             units.append({
@@ -671,7 +737,7 @@ def write_csv(data: dict, out: Path) -> None:
     with open(out, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["file", "visualid", "site", "unit_label", "test", "x_name", "x", "y_name", "y",
-                    "result", "pattern", "plist", "vector", "cycle", "pins",
+                    "result", "legend_count", "legend_keys", "pattern", "plist", "vector", "cycle", "pins", "legend_suffix",
                     "src_file", "src_line", "src_subroutine", "src_label", "src_label_offset", "src_expect", "src_note"])
         for u in data["units"]:
             fname = data["files"][u["file"]]["name"]
@@ -679,14 +745,23 @@ def write_csv(data: dict, out: Path) -> None:
                 for i, yv in enumerate(s["y"]):
                     for j, xv in enumerate(s["x"]):
                         c = s["rows"][i][j]
-                        lg = s["legend"].get(c, {}) if c != "*" else {}
-                        t = lg.get("trace") or {}
+                        if s["legend_mode"] == "coordinate":
+                            legends = s["cell_legend"].get(f"{i},{j}", [])
+                        else:
+                            lg = s["legend"].get(c) if not is_pass_cell(c) else None
+                            legends = [lg] if lg else []
+                        traces = [lg.get("trace") or {} for lg in legends]
+                        join = lambda key: " | ".join(str(lg[key]) for lg in legends if lg.get(key) not in (None, ""))
+                        join_trace = lambda key: " | ".join(str(t[key]) for t in traces if t.get(key) not in (None, ""))
                         w.writerow([fname, u["info"].get("visualid", ""), u["info"].get("siteid", ""), u["label"],
-                                    tkey, s["xname"], xv, s["yname"], yv, "PASS" if c == "*" else c,
-                                    lg.get("pattern", ""), lg.get("plist", ""), lg.get("vector", ""),
-                                    lg.get("cycle", ""), lg.get("pins", ""), t.get("file", ""), t.get("line", ""),
-                                    t.get("sub", ""), t.get("label", ""), t.get("label_offset", ""), t.get("expect", ""),
-                                    " ".join(x for x in (t.get("state"), t.get("note"), t.get("error")) if x)])
+                                    tkey, s["xname"], xv, s["yname"], yv, "PASS" if is_pass_cell(c) else c,
+                                    len(legends), join("key") or (c if legends else ""),
+                                    join("pattern"), join("plist"), join("vector"),
+                                    join("cycle"), join("pins"), join("suffix"),
+                                    join_trace("file"), join_trace("line"), join_trace("sub"), join_trace("label"),
+                                    join_trace("label_offset"), join_trace("expect"),
+                                    " | ".join(" ".join(str(t[key]) for key in ("state", "note", "error") if t.get(key))
+                                               for t in traces if any(t.get(key) for key in ("state", "note", "error")))])
 
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -813,8 +888,13 @@ table.ov td.t{max-width:520px;overflow:hidden;text-overflow:ellipsis;cursor:poin
 const DATA = __DATA__;
 const PAL=["#e5534b","#f0883e","#d29922","#a371f7","#db61a2","#1f6feb","#8b5a2b","#bf3989","#6e7781","#cf222e","#9a6700","#0550ae","#8250df","#953800","#116329","#4d2d00"];
 const $=s=>document.querySelector(s), el=(t,c,txt)=>{const e=document.createElement(t);if(c)e.className=c;if(txt!=null)e.textContent=txt;return e};
+const isPassCell=ch=>ch.length>0&&[...ch].every(c=>c==="*");
+const isUnknownCell=ch=>ch.length>0&&[...ch].every(c=>c==="?")
 const state={units:new Set(DATA.units.map(u=>u.id)),test:null,tab:"ov",pinned:null};
-const colorOf=ch=>ch==="*"?"var(--pass)":PAL[(ch.charCodeAt(0)-65+PAL.length*4)%PAL.length];
+const colorOf=ch=>isPassCell(ch)?"var(--pass)":(/^[A-Z]$/.test(ch)?PAL[(ch.charCodeAt(0)-65+PAL.length*4)%PAL.length]:"#d1242f");
+const patternNames=[...new Set(DATA.units.flatMap(u=>Object.values(u.shmoos).flatMap(s=>Object.values(s.legend).map(lg=>lg.pattern))).filter(Boolean))].sort();
+const patternColors=new Map(patternNames.map((name,i)=>[name,i<PAL.length?PAL[i]:`hsl(${(i*137.508)%360},60%,38%)`]));
+const patternColor=name=>patternColors.get(name)||"#6e7781";
 const fmt=(v,name)=>{if(typeof v!=="number")return String(v);const a=Math.abs(v);
   if(a!==0&&a<1e-6)return +(v*1e9).toPrecision(6)+"ns";return String(+v.toPrecision(6))+(/VOLT|vcc|PCODE/i.test(name)?"V":"")};
 const short=t=>t.split("::").pop();
@@ -855,39 +935,78 @@ function renderTests(){
 }
 
 function legendInfo(s,ch){
-  if(ch==="*")return null;const lg=s.legend[ch];
+  if(isPassCell(ch))return null;const lg=s.legend[ch];
   return lg||{pattern:"(no legend entry for '"+ch+"')",plist:"",vector:"",cycle:"",pins:"",raw:""};
+}
+
+function cellLegends(s,i,j,ch){
+  if(s.legend_mode==="coordinate")return s.cell_legend[`${i},${j}`]||[];
+  return isPassCell(ch)?[]:[legendInfo(s,ch)];
+}
+
+function cellPattern(s,i,j,ch){
+  const legends=cellLegends(s,i,j,ch),patterns=[...new Set(legends.map(lg=>lg.pattern).filter(Boolean))];
+  return {count:legends.length,patterns,color:patterns.length===1?patternColor(patterns[0]):"#6e7781"};
 }
 
 function showTip(ev,u,s,i,j){
   const ch=s.rows[i][j],tip=$("#tip");tip.innerHTML="";
   const add=(k,v)=>{if(v===""||v==null)return;const r=el("div");r.append(el("b",null,k+": "),document.createTextNode(v));tip.append(r)};
   add("Unit",u.label);add(s.xname,fmt(s.x[j],s.xname));add(s.yname,fmt(s.y[i],s.yname));
-  if(ch==="*")add("Result","PASS");else{const lg=legendInfo(s,ch);add("Result","FAIL ("+ch+")");add("Pattern",lg.pattern);add("Plist",lg.plist);
-    add("Fail vector/cycle",lg.vector?lg.vector+" / "+lg.cycle:"");add("Pins",lg.pins);
-    const t=lg.trace;if(t&&!t.error){add("Source",t.sub?`${t.sub}: ${t.label}+${t.label_offset} (CALL at line ${t.line})`:`line ${t.line}${t.label?"  "+t.label+"+"+t.label_offset:""}`);
-      add("Expected",t.expect);add("Captures",t.sub?"":[t.state,t.note].filter(Boolean).join("  "))}}
+  if(isPassCell(ch))add("Result","PASS");
+  else{
+    const legends=cellLegends(s,i,j,ch);
+    add("Result","FAIL ("+ch+")");
+    if(s.legend_mode==="coordinate"){
+      add("Failures",ch);add("Patterns",cellPattern(s,i,j,ch).patterns.length);
+      if(legends.length){const lg=legends[0];add("First pattern",lg.pattern);add("Plist",lg.plist);
+        add("Fail vector/cycle",lg.vector?lg.vector+" / "+lg.cycle:"");add("Pins",lg.pins);
+        if(legends.length>1)add("Details","Click the point to see all "+legends.length+" legend entries")}
+      else add("Legend","No coordinate legend matches this point");
+    }else{
+      const lg=legends[0];add("Pattern",lg.pattern);add("Plist",lg.plist);
+      add("Fail vector/cycle",lg.vector?lg.vector+" / "+lg.cycle:"");add("Pins",lg.pins);
+      const t=lg.trace;if(t&&!t.error){add("Source",t.sub?`${t.sub}: ${t.label}+${t.label_offset} (CALL at line ${t.line})`:`line ${t.line}${t.label?"  "+t.label+"+"+t.label_offset:""}`);
+        add("Expected",t.expect);add("Captures",t.sub?"":[t.state,t.note].filter(Boolean).join("  "))}}
+  }
   tip.style.display="block";moveTip(ev);
 }
 function moveTip(ev){const t=$("#tip");const w=t.offsetWidth,h=t.offsetHeight;
   let x=ev.clientX+14,y=ev.clientY+14;if(x+w>innerWidth)x=ev.clientX-w-14;if(y+h>innerHeight)y=ev.clientY-h-14;t.style.left=x+"px";t.style.top=Math.max(0,y)+"px"}
 function hideTip(){$("#tip").style.display="none"}
 
+function appendTraceDetail(d,t){
+  if(!t)return;
+  d.append(el("h4",null,"Pattern source"));
+  d.append(el("pre",null,t.error?`FLASH   : ${t.flash_path||""}\n${t.error}`:
+    `File    : ${t.file}\nFLASH   : ${t.flash_path}\nTID     : ${t.tid}   line item: ${t.lineitem}\n`+
+    (t.sub?`Location: inside subroutine ${t.sub}, called at file line ${t.line}\nLabel   : ${t.label?t.label+" + "+t.label_offset+" vectors (subroutine address "+t.addr+")":"(no subroutine label)"}\nNote    : ${t.note}`:
+    `Vector  : ${t.addr} at file line ${t.line}  ${t.op||"V"}\nLabel   : ${t.label?t.label+" + "+t.label_offset+" vectors":"(none before this vector)"}\nExpected: ${t.expect||"(no compares on this vector)"}`+
+    (t.state||t.note?`\nState   : ${t.state||""}\nNote    : ${t.note||""}`:""))));
+  if(!t.error)d.append(el("pre","ctx","  addr     cycle  line    opcode                         compares\n"+t.context.join("\n")));
+  if(!t.error&&t.grid&&DATA.grids&&DATA.grids[t.grid])d.append(waveGrid(DATA.grids[t.grid],t));
+}
+
 function showDetail(u,s,i,j){
   const ch=s.rows[i][j],d=$("#detail");d.style.display="block";d.innerHTML="";
   d.append(el("h4",null,`${u.label}  —  ${state.test}`));
-  d.append(el("div",null,`${s.xname} = ${fmt(s.x[j],s.xname)},  ${s.yname} = ${fmt(s.y[i],s.yname)}  →  ${ch==="*"?"PASS":"FAIL ("+ch+")"}`));
-  if(ch!=="*"){const lg=legendInfo(s,ch);
-    d.append(el("pre",null,`Pattern : ${lg.pattern}\nPlist   : ${lg.plist}\nDomain  : ${lg.domain||""}\nVector  : ${lg.vector}\nCycle   : ${lg.cycle}\nPins    : ${lg.pins}\n\nRaw     : ${lg.raw}`));
-    const t=lg.trace;
-    if(t){d.append(el("h4",null,"Pattern source"));
-      d.append(el("pre",null,t.error?`FLASH   : ${t.flash_path||""}\n${t.error}`:
-        `File    : ${t.file}\nFLASH   : ${t.flash_path}\nTID     : ${t.tid}   line item: ${t.lineitem}\n`+
-        (t.sub?`Location: inside subroutine ${t.sub}, called at file line ${t.line}\nLabel   : ${t.label?t.label+" + "+t.label_offset+" vectors (subroutine address "+t.addr+")":"(no subroutine label)"}\nNote    : ${t.note}`:
-        `Vector  : ${t.addr} at file line ${t.line}  ${t.op||"V"}\nLabel   : ${t.label?t.label+" + "+t.label_offset+" vectors":"(none before this vector)"}\nExpected: ${t.expect||"(no compares on this vector)"}`+
-        (t.state||t.note?`\nState   : ${t.state||""}\nNote    : ${t.note||""}`:""))));
-      if(!t.error)d.append(el("pre","ctx","  addr     cycle  line    opcode                         compares\n"+t.context.join("\n")));
-      if(!t.error&&t.grid&&DATA.grids&&DATA.grids[t.grid])d.append(waveGrid(DATA.grids[t.grid],t))}}
+  d.append(el("div",null,`${s.xname} = ${fmt(s.x[j],s.xname)},  ${s.yname} = ${fmt(s.y[i],s.yname)}  →  ${isPassCell(ch)?"PASS":"FAIL ("+ch+")"}`));
+  if(!isPassCell(ch)){
+    const legends=cellLegends(s,i,j,ch);
+    if(s.legend_mode==="coordinate"){
+      d.append(el("h4",null,`Failures: ${ch} | Patterns: ${cellPattern(s,i,j,ch).patterns.length}`));
+      d.append(el("h4",null,`Failure legends (${legends.length})`));
+      if(!legends.length)d.append(el("pre",null,"No coordinate legend matches this point."));
+      legends.forEach((lg,n)=>{
+        d.append(el("pre",null,`${n+1}. ${lg.key||""}\nPattern : ${lg.pattern}\nPlist   : ${lg.plist}\nDomain  : ${lg.domain||""}\nVector  : ${lg.vector}\nCycle   : ${lg.cycle}\nPins    : ${lg.pins}\nSuffix  : ${lg.suffix||""}\n\nRaw     : ${lg.raw}`));
+        appendTraceDetail(d,lg.trace);
+      });
+    }else{
+      const lg=legends[0];
+      d.append(el("pre",null,`Pattern : ${lg.pattern}\nPlist   : ${lg.plist}\nDomain  : ${lg.domain||""}\nVector  : ${lg.vector}\nCycle   : ${lg.cycle}\nPins    : ${lg.pins}\nSuffix  : ${lg.suffix||""}\n\nRaw     : ${lg.raw}`));
+      appendTraceDetail(d,lg.trace);
+    }
+  }
 
 function waveGrid(g,t){
   const box=el("div");
@@ -927,8 +1046,11 @@ function shmooCard(u,t){
   for(let i=s.y.length-1;i>=0;i--){
     const tr=el("tr");tr.append(el("th","yl",fmt(s.y[i],s.yname)));
     for(let j=0;j<s.x.length;j++){
-      const ch=s.rows[i][j],td=el("td",ch==="*"?"p":(ch==="?"?"n":""));
-      if(ch!=="*"&&ch!=="?"){td.style.background=colorOf(ch);td.textContent=ch}
+      const ch=s.rows[i][j],pass=isPassCell(ch),unknown=isUnknownCell(ch),td=el("td",pass?"p":(unknown?"n":""));
+      if(!pass&&!unknown){
+        td.style.background=s.legend_mode==="coordinate"?cellPattern(s,i,j,ch).color:colorOf(ch);
+        td.style.color="#fff";td.textContent=ch;
+      }
       if(state.pinned&&state.pinned.u===u.id&&state.pinned.i===i&&state.pinned.j===j)td.classList.add("pin");
       td.onmouseenter=e=>showTip(e,u,s,i,j);td.onmousemove=moveTip;td.onmouseleave=hideTip;
       td.onclick=()=>{state.pinned={u:u.id,i,j};document.querySelectorAll("td.pin").forEach(x=>x.classList.remove("pin"));td.classList.add("pin");showDetail(u,s,i,j)};
@@ -941,13 +1063,37 @@ function shmooCard(u,t){
   const wrap=el("div");wrap.style.display="flex";wrap.style.gap="6px";wrap.style.alignItems="center";
   const yl=el("div","ax",s.yname);yl.style.cssText="writing-mode:vertical-rl;transform:rotate(180deg);font-size:11px;font-weight:600";
   wrap.append(yl,tb);c.append(wrap);
-  const used={};s.rows.forEach(r=>[...r].forEach(ch=>{if(ch!=="*"&&ch!=="?")used[ch]=(used[ch]||0)+1}));
-  const keys=Object.keys(used).sort();
-  if(keys.length){
-    const lt=el("table","lg");const hr=el("tr");["","#pts","Pattern","Plist","Vec/Cyc","Pins"].forEach(h=>hr.append(el("th",null,h)));lt.append(hr);
-    keys.forEach(k=>{const lg=legendInfo(s,k),tr=el("tr");const sw=el("td");const b=el("span","sw");b.style.background=colorOf(k);sw.append(b,k);
-      tr.append(sw,el("td",null,used[k]),el("td",null,lg.pattern),el("td",null,lg.plist),el("td",null,lg.vector?lg.vector+"/"+lg.cycle:""),el("td",null,lg.pins));lt.append(tr)});
-    c.append(lt);
+  if(s.legend_mode==="coordinate"){
+    c.append(el("div","hint","Numbers = failure counts per point. A single pattern uses the same color across plots; gray = multiple patterns. Click to see all failures."));
+    const used=new Map();
+    s.rows.forEach((row,i)=>row.forEach((ch,j)=>{
+      if(isPassCell(ch))return;
+      const byPattern=new Map();
+      cellLegends(s,i,j,ch).forEach(lg=>byPattern.set(lg.pattern,(byPattern.get(lg.pattern)||0)+1));
+      byPattern.forEach((count,name)=>{
+        const entry=used.get(name)||{points:0,failures:0};
+        entry.points++;entry.failures+=count;used.set(name,entry);
+      });
+    }));
+    if(used.size){
+      const lt=el("table","lg"),hr=el("tr");
+      ["Color","Pattern","#pts","#failures"].forEach(h=>hr.append(el("th",null,h)));lt.append(hr);
+      [...used.keys()].sort().forEach(name=>{
+        const entry=used.get(name),tr=el("tr"),sw=el("td"),b=el("span","sw");
+        b.style.background=patternColor(name);sw.append(b);
+        tr.append(sw,el("td",null,name),el("td",null,entry.points),el("td",null,entry.failures));lt.append(tr);
+      });
+      c.append(lt);
+    }
+  }else{
+    const used={};s.rows.forEach(r=>r.forEach(ch=>{if(!isPassCell(ch)&&!isUnknownCell(ch))used[ch]=(used[ch]||0)+1}));
+    const keys=Object.keys(used).sort();
+    if(keys.length){
+      const lt=el("table","lg");const hr=el("tr");["","#pts","Pattern","Plist","Vec/Cyc","Pins"].forEach(h=>hr.append(el("th",null,h)));lt.append(hr);
+      keys.forEach(k=>{const lg=legendInfo(s,k),tr=el("tr");const sw=el("td");const b=el("span","sw");b.style.background=colorOf(k);sw.append(b,k);
+        tr.append(sw,el("td",null,used[k]),el("td",null,lg.pattern),el("td",null,lg.plist),el("td",null,lg.vector?lg.vector+"/"+lg.cycle:""),el("td",null,lg.pins));lt.append(tr)});
+      c.append(lt);
+    }
   }
   return c;
 }
@@ -955,7 +1101,7 @@ function shmooCard(u,t){
 function renderPlots(v){
   if(!state.test){v.append(el("div","hint","Select a test on the left, or click a cell in the Overview."));return}
   v.append(el("h2",null,state.test));
-  v.append(el("div","hint","Hover a point for the limiting pattern; click to pin details below. Green = pass, letters = failure legend."));
+  v.append(el("div","hint","Hover a point for its result; click to pin failure details below. Green = pass; colored cells = failures."));
   const cards=el("div","cards");
   const us=selUnits().filter(u=>u.shmoos[state.test]);
   if(!us.length)cards.append(el("div","hint","No selected unit has this test."));

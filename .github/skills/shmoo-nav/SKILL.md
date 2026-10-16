@@ -6,7 +6,7 @@ argument-hint: '<VPO | ituff path | folder | glob> [more...] [--filter REGEX] [-
 
 # Shmoo-Nav
 
-Parses `_ShmooParams`, `_ShmooResults` and `^LEGEND^<C>` records from one or more ituffs and writes a self-contained HTML (no external deps, shareable as one file).
+Parses `_ShmooParams`, `_ShmooResults`, character-keyed `^LEGEND^<C>` and coordinate-keyed `^LEGEND^[<x>^<y>^<n>]` records from one or more ituffs and writes a self-contained HTML (no external deps, shareable as one file).
 
 ## Procedure
 
@@ -29,7 +29,8 @@ Parses `_ShmooParams`, `_ShmooResults` and `^LEGEND^<C>` records from one or mor
 ## Notes
 
 - Script: [shmoo_nav.py](./scripts/shmoo_nav.py). `--help` for options.
-- Result rows = Y steps starting at Y start (bottom of plot); chars = X steps. `*` = pass, other letters map to LEGEND entries.
+- Result rows = Y steps starting at Y start (bottom of plot). Standard results have one symbol per X step; coordinate-keyed results concatenate decimal failure counts per X/Y point. `*` = pass.
+- Coordinate-keyed legends are matched to their X/Y point and validated against the decimal failure counts in the result rows. Each point displays its failure count, with consistent pattern colors for single-pattern points and gray for mixed-pattern points. Clicking lists all associated legend entries, including the optional suffix after the pins.
 - Units are separated by `2_lbeg`/`2_lend`; label = visual ID | site | start time; bins come from `3_curibin`/`3_curfbin`. Test keys include the die from `0_tssid` (e.g. `[U1]`).
 - Multiple ituffs/folders can be combined into one HTML for cross-unit comparison.
 - Test program trace: the header attribute `4_tsattrs_tplpath` (and `stplpath`) records the program on the tester's `I:` drive, which is the site share's `\intel` folder (the part of the ituff path before `\hdmxdata\`). Other sites are tried as a fallback. `socpath` / `envpath` point at the tester's local `D:\TPRecipes` and can't be resolved remotely.

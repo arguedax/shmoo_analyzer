@@ -88,12 +88,13 @@ python .github\skills\shmoo-nav\scripts\shmoo_nav.py lot.itf.gz --filter "CFCMEM
 | Record | Meaning |
 |---|---|
 | `0_tname_<test>_ShmooParams` / `0_strgval_<x>^<xs>^<xe>^<xstep>^<y>^<ys>^<ye>^<ystep>_ShmooHub` | Axis definitions |
-| `0_tname_<test>_ShmooResults` / `0_strgval_<row0>_<row1>_...` | One row per Y step starting at Y start (plot bottom); one char per X step. `*` = pass |
+| `0_tname_<test>_ShmooResults` / `0_strgval_<row0>_<row1>_...` | One row per Y step starting at Y start (plot bottom). Standard results use one symbol per X step; coordinate-keyed results concatenate decimal failure counts per X/Y point. `*` = pass |
 | `0_tname_<test>^LEGEND^<C>` / `0_strgval_<pattern>\|<idx>:<plist>:<domain>(<cycle>,<vector>,..):<pins>` | Meaning of fail character `<C>`; cycle is zero-based |
+| `0_tname_<test>^LEGEND^[<x>^<y>^<n>]` | Failure legend(s) associated with coordinate X/Y; multiple entries are shown together when that point is selected |
 | `2_lbeg` … `2_lend` | One unit run; labelled `visual ID \| site \| start time`, bins from `3_curibin` / `3_curfbin` |
 | `0_tssid_<die>` | Die the following tests ran on (shown as `[U1]` etc. in test names) |
 
-A part retested in the same ituff (e.g. site swap) appears as separate units.
+A part retested in the same ituff (e.g. site swap) appears as separate units. Coordinate-keyed results concatenate decimal failure counts (for example, `10` occupies two characters but represents one point); these are validated against the coordinate legends to preserve the X/Y positions. Each failed point displays its failure count. Points whose failures all reference one pattern share that pattern's color across plots; points with multiple patterns are gray. The pattern legend lists point and failure totals, and clicking a point lists all its failures.
 
 With `--trace-patterns`, a failure in the pattern is matched by both its vector address and cycle, then displayed with its `.hdmt.data` line, nearest label, expected pin values and capture note. The vector grid shows nearby vectors and highlights the failing strobe. If the failure is inside a called compiled subroutine, the grid marks the CALL row with an `F` under the failing pin and reports the nearest subroutine label; source vector lines are not available for compiled subroutines.
 
